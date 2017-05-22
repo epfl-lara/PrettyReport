@@ -58,10 +58,14 @@ object PrettyReporter {
 
       lazy val counterexample: Option[Seq[String]] = status match {
         case Invalid(info) => Some({
-          val details = (info map {
-            case (vd, JString(value)) => s"  when $vd is:\n${splitPadReform(value, "    ")}";
-            case _ => ???
-          })
+          val details = if (info.nonEmpty) {
+            (info map {
+              case (vd, JString(value)) => s"  when $vd is:\n${splitPadReform(value, "    ")}";
+              case _ => ???
+            })
+          } else {
+            Seq("empty counter example")
+          }
           s"Counterexample for $kind violation in `$fd`:" +: details
         })
         case _ => None
@@ -95,13 +99,7 @@ object PrettyReporter {
         status = j2Status(sub \ "status", sub)
         JString(kind) = sub \ "kind"
         JString(fd) = sub \ "fd"
-      } yield {
-
-        // TODO add support for multiline positions
-        if (pos.begin.line != pos.end.line) { ??? }
-
-        VCReport(pos, kind, fd, status)
-      }
+      } yield VCReport(pos, kind, fd, status)
 
       val byFile: Map[String, Seq[VCReport]] = vcrs groupBy { _.pos.file }
       val htmls = byFile map { case (file, vcrs) =>
@@ -111,6 +109,7 @@ object PrettyReporter {
 
       println(htmls mkString ("<br />" * 3))
     }
+
 
     /**
       * Process (sorted) [[VCReport]]s for the given source file.
@@ -125,15 +124,19 @@ object PrettyReporter {
       // First, we convert the file to HTML without adding the reports.
       // Drop the four first line (GNU source-highlight adds a comment we don't want).
       val htmlFile = convert2HTML(file)
-      val html = read(htmlFile) drop 4
+      val fullHTML = read(htmlFile)
+      debug(s"Full HTML before normalisation:\n${fullHTML drop 4 mkString "\n"}")
+      val html = fullHTML drop 4 map normaliseHTML
       assert(html.nonEmpty && (html.head startsWith "<pre>") && (html.last endsWith "</pre>"))
+      debug(s"HTML after normalisation:\n$html")
 
       // The "past" contain all the lines that were already processed.
       // The "future" contain what remains to be seen.
       var pastLines = Seq[String]()
       var mostRecentPast = StringBuilder.newBuilder // keep track of what was not yet pushed in `pastLines`
       var mostRecentFuture = "" // keep track of what lies directly ahead of us, on the current line.
-      var closeTagQueue = Seq[(Coord, String)]() // keep track, for the mostRecentFuture, of the closing tags
+      var openTagStack = Seq[String]()
+      var closeTagStack = Seq[(Coord, String, Option[Seq[String]])]() // keep track, for the mostRecentFuture, of the closing tags & extra info
       var futurePastLines = Seq[String]() // keep track of extra information that should go into the
                                           // "past" soon (e.g. values for counter example)
       var futureLines = html
@@ -148,13 +151,19 @@ object PrettyReporter {
       // Update the state. To be called when the current line should be entirely consumed.
       // Closing tags are inserted on the current line if need be.
       def consumeMostRecentFutureAndContinue(): Unit = {
-        while (closeTagQueue.nonEmpty) { consumeUntilPosition(closeTagQueue.head._1, false) }
+        // Place all tag closing on the current line
+        while (closeTagStack.headOption match {
+          case Some((coord, _, _)) if coord.line == currentLine => true
+          case _ => false
+        }) { consumeUntilPosition(closeTagStack.head._1) }
 
-        assert(closeTagQueue.isEmpty)
+        assert(closeTagStack.length == openTagStack.length)
 
-        mostRecentPast ++= mostRecentFuture
+        // Finish consuming the line and close any open tag
+        mostRecentPast ++= mostRecentFuture + (closeTagStack map { case (_, tag, _) => tag } mkString "")
 
         if (futureLines.isEmpty) {
+          assert(closeTagStack.isEmpty)
           mostRecentFuture = ""
         } else {
           mostRecentFuture = futureLines.head
@@ -165,89 +174,99 @@ object PrettyReporter {
         futurePastLines = Seq()
         mostRecentPast = StringBuilder.newBuilder
 
+        // Re-open any temporarily closed tag
+        if (openTagStack.nonEmpty) {
+          mostRecentPast ++= openTagStack.reverse mkString ""
+        }
+
         currentLine += 1
         currentColumn = 0
       }
 
       // Update the state after consuming one source (scala) character,
       // taking into account the HTML translation.
-      @tailrec
       def consumeOneSourceCharacterAndContinue(): Unit = {
-        // Consume one character, but do not interpret it so `column` doesn't change
-        def consumeOne(): Char = {
+        def consumeOne(): Unit = {
           assert(mostRecentFuture.nonEmpty)
-          val current = mostRecentFuture.charAt(0)
-          mostRecentFuture = mostRecentFuture drop 1
+          val current = mostRecentFuture.head
+          mostRecentFuture = mostRecentFuture.tail
           mostRecentPast += current
-          current
         }
 
-        @tailrec
-        def consumeUntilFound(target: Char): Unit = if (consumeOne() != target) { consumeUntilFound(target) }
-
-        def moveByOneAndUpdateClosingTag(): Unit = {
-          currentColumn += 1
-
-          // Insert all closing tag for the current position.
-          while (closeTagQueue.nonEmpty && closeTagQueue.head._1.col == currentColumn) {
-            debug(s"Inserting closing tag at position $currentLine:$currentColumn")
-            val tag = closeTagQueue.head._2
-            closeTagQueue = closeTagQueue.tail
-            insertHTML(tag)
-          }
+        def consumeUntilFound(c: Char): Unit = {
+          assert(mostRecentFuture.nonEmpty)
+          val (word, rest) = splitAt(mostRecentFuture, c)
+          mostRecentFuture = rest
+          mostRecentPast ++= word
         }
 
-        val current = consumeOne()
-        if (current == '<') {
-          // We hit a HTML tag opening. We consume until we find the closing '>'
-          consumeUntilFound('>')
-          // Since we haven't read a source character, we start again.
-          consumeOneSourceCharacterAndContinue()
-        } else if (current == '&') {
-          // We hit an encoded character, so we find the next ';' ending the sequence
-          consumeUntilFound(';')
-          // But this count as ONE source character
-          moveByOneAndUpdateClosingTag()
-        } else {
-          // We just consumed a source character!
-          moveByOneAndUpdateClosingTag()
+        // Assuming a "normalised" HTML, i.e. [<t1><t2>...<tn>](c|&...;)[</tn>...</t2></t1>]
+        // Note: sometimes we want to go one past the end of the line to insert a closing tag.
+        if (mostRecentFuture.nonEmpty) {
+          while (mostRecentFuture.head == '<') { consumeUntilFound('>') }
+          if (mostRecentFuture.head == '&') { consumeUntilFound(';') }
+          else { consumeOne() }
+        }
+        currentColumn += 1
+        while (mostRecentFuture startsWith "</") { consumeUntilFound('>') }
+
+        // Insert all closing tag for the current position.
+        while (closeTagStack.headOption match {
+          case Some((coord, _, _)) if coord.line == currentLine && coord.col == currentColumn => true
+          case _ => false
+        }) {
+          debug(s"Inserting closing tag at position $currentLine:$currentColumn")
+          val (_, closeTag, extraOpt) = closeTagStack.head
+          insertTag(closeTag)
+          extraOpt foreach insertExtraInfoInFuturePast
+
+          // Pop the stacks
+          closeTagStack = closeTagStack.tail
+          openTagStack = openTagStack.tail
+          assert(closeTagStack.length == openTagStack.length)
         }
       }
 
       // Go to the given position.
-      def consumeUntilPosition(coord: Coord, exlusive: Boolean) = {
-        val columnCorrection = if (exlusive) +1 else 0 // stop just before
-
+      def consumeUntilPosition(coord: Coord) = {
         assert(
           // Check that the caller doesn't want to go back!
           (coord.line > currentLine) || {
-            (coord.line == currentLine) && (coord.col >= currentColumn + columnCorrection)
-          }
+            (coord.line == currentLine) && (coord.col >= currentColumn)}
         )
 
-        debug(s"Looking for position $coord (exlusive? $exlusive) from $currentLine:$currentColumn")
+        debug(s"Looking for position $coord from $currentLine:$currentColumn")
         while (coord.line > currentLine) { consumeMostRecentFutureAndContinue() }
-        while (coord.col > (currentColumn + columnCorrection)) { consumeOneSourceCharacterAndContinue() }
+        while (coord.col > currentColumn) { consumeOneSourceCharacterAndContinue() }
         debug(s"Now at position $currentLine:$currentColumn")
       }
 
 
       // Add some content to the past, without moving the position.
-      def insertHTML(content: String): Unit = mostRecentPast ++= content
+      def insertTag(content: String): Unit = mostRecentPast ++= content
 
-      def registerCloseTag(tag: String, pos: Coord): Unit = {
-        assert(pos.line == currentLine)  // Tag have to be closed on the same line
-        assert(pos.col >= currentColumn) // and in the future.
-        debug(s"Registering closing tag for $pos from $currentLine:$currentColumn")
-        closeTagQueue = (pos -> tag) +: closeTagQueue
-      }
-
-      def registerExtraInfo(extra: Seq[String]) = {
+      def insertExtraInfoInFuturePast(extra: Seq[String]): Unit = {
         // Tag based on the default theme of GNU source-highlight
         val pre = """<i><font color="#9A1900">// """
         val post = """</font></i>"""
         val processed = extra map { str => splitPadReform(escapeHTML(str), pre, post) }
         futurePastLines = futurePastLines ++ processed
+      }
+
+      def insertTags(openTag: String, closeTag: String, extraOpt: Option[Seq[String]], closePos: Coord): Unit = {
+        insertTag(openTag)
+
+        // Register open tag, in case it's a multi-line position
+        openTagStack = openTag +: openTagStack
+
+        // Register close tag (for a future position)
+        assert(closePos.line > currentLine || {
+          (closePos.line == currentLine) && (closePos.col > currentColumn)
+        })
+        debug(s"Registering closing tag for $closePos from $currentLine:$currentColumn")
+        closeTagStack = (closePos, closeTag, extraOpt) +: closeTagStack
+
+        assert(closeTagStack.length == openTagStack.length)
       }
 
 
@@ -258,17 +277,25 @@ object PrettyReporter {
         val currentReport = futureReports.head
         futureReports = futureReports.tail
 
-        // Go to opening position & insert opening tag + some additional info for counterexamples.
-        consumeUntilPosition(currentReport.pos.begin, true)
-        val color = currentReport.color
-        val openTag = s"""<span style="background-color: $color">"""
-        insertHTML(openTag)
-        currentReport.counterexample foreach registerExtraInfo
+        debug(s"Current Report Position: ${currentReport.pos}")
 
+        // Go to opening position & insert opening tag + some additional info for counterexamples.
         // Register closing tag (because tags can be nested)
-        val closeTag = s"""</span>"""
-        val closePos = Coord(currentReport.pos.end.line, currentReport.pos.end.col - 1) // make it inclusive
-        registerCloseTag(closeTag, closePos)
+        val targetCol = currentReport.pos.begin.col
+        if (targetCol == 0) {
+          /* we go nowhere */
+        } else {
+          /* we go right before the position */
+          val target = currentReport.pos.begin.copy(col = targetCol - 1)
+          consumeUntilPosition(target)
+        }
+        val color = currentReport.color
+        val openTag = s"""<!-- open pos = ${currentReport.pos}--><span style="background-color: $color">"""
+        val closeTag = s"""</span><!-- close pos = ${currentReport.pos}-->"""
+        val closeTargetCol = currentReport.pos.end.col
+        val closePos = currentReport.pos.end.copy(col = closeTargetCol - 1) // make it inclusive
+        val extraOpt = currentReport.counterexample
+        insertTags(openTag, closeTag, extraOpt, closePos)
       }
 
       // Add the remaining lines so that the "past" contains all the "future".
@@ -316,6 +343,99 @@ object PrettyReporter {
     }
 
     private def escapeHTML(value: String): String = value // FIXME implement proper HTML escape
+
+    // Split at (include 'c' in first part)
+    private def splitAt(str: String, c: Char): (String, String) = {
+      val idx = (str indexOf c) + 1
+      str splitAt idx
+    }
+
+    /**
+      * Normalise HTML input: each HTML tag is opened before each character and close right after.
+      *
+      * Example: <b>bold</b> is mapped to <b>b</b><b>o</b><b>l</b><b>d</b>
+      */
+    private def normaliseHTML(html: String): String = {
+      var future = html
+      val builder = StringBuilder.newBuilder
+      var openTags = Seq[String]()
+
+      def makeCloseTag(openTag: String): String = {
+        assert(openTag.nonEmpty && (openTag startsWith "<") && (openTag endsWith ">"))
+        "</" + (openTag drop 1 takeWhile { c => !(Seq('>', ' ') contains c) }) + ">"
+      }
+
+      def processTag(): Unit = {
+        assert(future.head == '<')
+        assert(future contains '>')
+
+        val (tag, rest) = splitAt(future, '>')
+        future = rest // drop tag
+
+        if (tag(1) == '/') {
+          // process close
+          assert(tag == makeCloseTag(openTags.head))
+          openTags = openTags.tail
+        } else {
+          // process open
+          openTags = tag +: openTags
+        }
+      }
+
+      def injectOpens(): Unit = {
+        openTags.reverse foreach { tag =>
+          builder ++= tag
+        }
+      }
+
+      def injectCloses(): Unit = {
+        openTags foreach { tag =>
+          builder ++= makeCloseTag(tag)
+        }
+      }
+
+      def copyUntil(c: Char): Unit = {
+        injectOpens()
+        val (word, rest) = splitAt(future, c)
+        builder ++= word
+        future = rest
+        injectCloses()
+      }
+
+      def copyOne(): Unit = {
+        injectOpens()
+        val current = future.head
+        builder += current
+        future = future.tail
+        injectCloses()
+      }
+
+      // All tags are expected to be open and closed on the same line.
+      // Except for <pre><tt> which is closed on a different line.
+      val init = "<pre><tt>"
+      if (future startsWith init) {
+        future = future drop init.length
+        builder ++= init
+      }
+
+      val tini = "</tt></pre>"
+      val ending = if (future endsWith tini) {
+        future = future dropRight tini.length
+        tini
+      } else ""
+
+      // Process each remaining tag/encoded character/regular character
+      while (future.nonEmpty) future.head match {
+        case '<' => processTag()
+        case '&' => copyUntil(';')
+        case _   => copyOne()
+      }
+
+      // Path ending
+      builder ++= ending
+
+      builder.toString
+    }
 
     /**
       * Read a file and return its content, line by line.
@@ -389,7 +509,7 @@ object PrettyReporter {
 
     def j2Status(hint: JValue, subReport: JValue): Status = hint match {
       case JString("valid") => Valid
-      case JString("unknown") => Unknown
+      case JString("unknown") | JString("timeout") => Unknown
       case JString("invalid") =>
         val JObject(info) = subReport \ "counterexample"
         Invalid(info)
