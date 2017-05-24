@@ -104,7 +104,10 @@ object PrettyReporter {
       val byFile: Map[String, Seq[VCReport]] = vcrs groupBy { _.pos.file }
       val htmls = byFile map { case (file, vcrs) =>
         s"""<p>File: <b>$file</b></p><br />""" +
-        process(file, sort(vcrs))
+        process(file, sort(vcrs filter { _.status match {
+          case Invalid(_) => true // keep only counterexample
+          case _ => false
+        }}))
       }
 
       println(htmls mkString ("<br />" * 3))
