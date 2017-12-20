@@ -1,13 +1,14 @@
 package pretty
 
 import java.io.{ BufferedReader, File, FileInputStream, InputStreamReader }
-import java.util.Scanner
-
-import org.json4s._
-import org.json4s.native.JsonMethods._
 
 import scala.annotation.tailrec
 import sys.process._
+
+import io.circe.Json
+
+import stainless.utils.JsonUtils.parseFile
+import stainless.verification.VerificationReport
 
 /**
   * Read a JSON report from Stainless (expected as the only argument),
@@ -16,28 +17,25 @@ import sys.process._
   * Require GNU source-highlight on the $PATH.
   */
 object PrettyReporter {
-  val DEBUG = false
+  private val DEBUG = false
 
-  def main(args: Array[String]): Unit = {
+  def main(args: Array[String]): Unit = try {
     if (args.length != 1) { help() } // and quit
 
-    val inputFile = args(0)
-    debug(s"Reading input JSON file: $inputFile")
-    val sc = new Scanner(new File(inputFile))
-    val sb = new StringBuilder
-    while (sc.hasNextLine) { sb ++= sc.nextLine }
+    val input = new File(args(0))
+    debug(s"Reading input JSON file: $input")
 
-    parseOpt(sb.toString) match {
-      case None => exit("Couldn't parse JSON report")
-      case Some(report) => details.process(report)
-    }
+    val json = parseFile(input)
+    details.process(json)
+  } catch {
+    case e: Throwable => exit(s"[FATAL ERROR] $e")
   }
 
-  def splitPadReform(str: String, pad: String, post: String = "", on: String = "\n") = {
+  private def splitPadReform(str: String, pad: String, post: String = "", on: String = "\n"): String = {
     str split on map { pad + _ + post } mkString on
   }
 
-  private def debug(msg: => String) = if (DEBUG) { System.err.println(splitPadReform(msg, "[DEBUG] ")) }
+  private def debug(msg: => String): Unit = if (DEBUG) { System.err.println(splitPadReform(msg, "[DEBUG] ")) }
 
   private def exit(msg: String): Nothing = {
     System.err.println(msg)
@@ -47,8 +45,8 @@ object PrettyReporter {
   private def help() = exit("Expected one argument: the path to the JSON report.")
 
   private object details {
-    import jdetails._
 
+    // Simpler representation for this project purposes.
     case class VCReport(pos: Position, kind: String, fd: String, status: Status) {
       lazy val color: String = status match {
         case Unknown    => "Khaki"
@@ -60,7 +58,7 @@ object PrettyReporter {
         case Invalid(info) => Some({
           val details = if (info.nonEmpty) {
             (info map {
-              case (vd, JString(value)) => s"  when $vd is:\n${splitPadReform(value, "    ")}";
+              case (vd, value) => s"  when $vd is:\n${splitPadReform(value, "    ")}";
               case _ => ???
             })
           } else {
@@ -80,26 +78,41 @@ object PrettyReporter {
       override def toString: String = s"$line:$col"
     }
 
+    type VariableName = String
+    type Value = String
+
     abstract class Status
     case object Unknown extends Status
     case object Valid   extends Status
-    case class  Invalid(info: List[JField]) extends Status
+    case class  Invalid(model: List[(VariableName, Value)]) extends Status
 
+    private def fromInoxPosition(pos: inox.utils.Position): Position = pos match {
+      case p: inox.utils.DefinedPosition => Position(p.file.getAbsolutePath, fromInoxCoord(p.focusBegin), fromInoxCoord(p.focusEnd))
+      case p => Position(p.file.getAbsolutePath, fromInoxCoord(p), fromInoxCoord(p))
+    }
+
+    private def fromInoxCoord(pos: inox.utils.Position) = Coord(pos.line, pos.col)
+
+    private def fromStainlessStatus(status: VerificationReport.Status): Status = status match {
+      case VerificationReport.Status.Valid => Valid
+      case VerificationReport.Status.ValidFromCache => Valid
+      case VerificationReport.Status.Inconclusive(_) => Unknown
+      case VerificationReport.Status.Invalid(model) => Invalid(model.toList)
+    }
 
     /**
       * Entry point for processing:
       * extract the [[VCReport]]s for each files,
       * then process each file one at a time and output the results.
       */
-    def process(report: JValue): Unit = {
+    def process(json: Json): Unit = {
+      val report = VerificationReport.parse(json.hcursor.downField("verification").focus.get)
+
       val vcrs: Seq[VCReport] = for {
-        JArray(subReports) <- report \ "verification"
-        sub <- subReports
-        pos <- j2Position(sub \ "pos") // filter out Unknown position
-        status = j2Status(sub \ "status", sub)
-        JString(kind) = sub \ "kind"
-        JString(fd) = sub \ "fd"
-      } yield VCReport(pos, kind, fd, status)
+        record <- report.results
+        pos = fromInoxPosition(record.pos)
+        status = fromStainlessStatus(record.status)
+      } yield VCReport(pos, record.kind, record.id.toString, status)
 
       val byFile: Map[String, Seq[VCReport]] = vcrs groupBy { _.pos.file }
       val htmls = byFile map { case (file, vcrs) =>
@@ -488,37 +501,5 @@ object PrettyReporter {
     }
   }
 
-  /**
-    * Provides facilities to convert JSON objects into
-    * [[PrettyReporter.details.Coord]],
-    * [[PrettyReporter.details.Position]] and
-    * [[PrettyReporter.details.VCReport]]
-    */
-  private object jdetails {
-    import details._
-
-    def j2Coord(value: JValue) = {
-      val JInt(line) = value \ "line"
-      val JInt(col) = value \ "col"
-      Coord(line.intValue, col.intValue)
-    }
-
-    def j2Position(value: JValue): Option[Position] = if (value == JString("Unknown")) { None } else {
-      val JString(file) = value \ "file"
-      val begin = j2Coord(value \ "begin")
-      val end = j2Coord(value \ "end")
-      Some(Position(file, begin, end))
-    }
-
-    def j2Status(hint: JValue, subReport: JValue): Status = hint match {
-      case JString("valid") => Valid
-      case JString("unknown") | JString("timeout") => Unknown
-      case JString("invalid") =>
-        val JObject(info) = subReport \ "counterexample"
-        Invalid(info)
-      case _ => exit(s"Unknown hint for status: $hint")
-    }
-
-  }
-
 }
+
